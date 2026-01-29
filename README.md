@@ -54,14 +54,6 @@ pip install -r requirements.txt
 python train.py
 ```
 
-### 3. Launch Gradio UI
-
-```bash
-python gradio_app.py
-```
-
-## 📖 Detailed Usage
-
 ### Training Only
 ```bash
 python train.py --train-only
