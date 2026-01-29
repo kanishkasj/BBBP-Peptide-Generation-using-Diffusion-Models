@@ -1,0 +1,19 @@
+# Peptide BBBP Generation System - Requirements
+
+# Core ML/DL frameworks
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# NLP/Embeddings
+gensim>=4.3.0
+
+# Visualization & UI
+gradio>=4.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tqdm>=4.65.0
+
+# Utilities
+joblib>=1.3.0
