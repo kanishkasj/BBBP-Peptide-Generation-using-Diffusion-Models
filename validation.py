@@ -51,20 +51,24 @@ def validate_peptides(peptides, classifier_model, scaler, biovec_model,
     return results
 
 
-def validate_all_generated(threshold=BBBP_THRESHOLD,return_scores=False):
+def validate_all_generated(threshold=BBBP_THRESHOLD, return_scores=False):
     """
     Validate all generated peptides from the generated_peptides directory
     
     Args:
         threshold: BBBP probability threshold
+        return_scores: Whether to return all BBBP scores
         
     Returns:
-        Dictionary with validation statistics
+        Dictionary with validation statistics and validated peptides
+        If return_scores=True, also returns list of all scores
     """
     print("\n" + "=" * 60)
     print("STEP 8: Validating Generated Peptides")
     print("=" * 60)
+    
     all_scores = []
+    
     # Load classifier
     print("\nLoading classifier...")
     classifier_model, scaler, biovec_model = load_classifier()
@@ -117,8 +121,9 @@ def validate_all_generated(threshold=BBBP_THRESHOLD,return_scores=False):
         validated_path = os.path.join(GENERATED_DIR, f"validated_len_{length}.csv")
         validated_df.to_csv(validated_path, index=False)
         
-        # Collect valid peptides
+        # Collect scores and valid peptides
         for seq, prob, is_valid in results:
+            all_scores.append(prob)  # Collect all scores for evaluation
             if is_valid:
                 validated_peptides.append({
                     'seq': seq,
@@ -132,17 +137,15 @@ def validate_all_generated(threshold=BBBP_THRESHOLD,return_scores=False):
         valid_path = os.path.join(GENERATED_DIR, "validated_bbbp_peptides.csv")
         valid_df.to_csv(valid_path, index=False)
         print(f"\nValid peptides saved to {valid_path}")
-    if return_scores:
-        return stats, valid_peptides, all_scores  
-    return stats, valid_peptides
-
+    
     # Print summary
     print("\n" + "=" * 60)
     print("VALIDATION SUMMARY")
     print("=" * 60)
     print(f"Total peptides: {stats['total']}")
     print(f"Valid BBBP+ (≥{threshold:.0%}): {stats['valid']}")
-    print(f"Overall acceptance rate: {stats['valid']/stats['total']*100:.1f}%")
+    if stats['total'] > 0:
+        print(f"Overall acceptance rate: {stats['valid']/stats['total']*100:.1f}%")
     
     print("\nBy length:")
     for length in sorted(stats['by_length'].keys()):
@@ -150,6 +153,8 @@ def validate_all_generated(threshold=BBBP_THRESHOLD,return_scores=False):
         print(f"  Length {length:2d}: {length_stats['valid']:4d}/{length_stats['total']:4d} "
               f"({length_stats['percentage']:.1f}%)")
     
+    if return_scores:
+        return stats, validated_peptides, all_scores
     return stats, validated_peptides
 
 
@@ -175,7 +180,7 @@ def batch_predict(sequences, classifier_model, scaler, biovec_model):
 
 if __name__ == "__main__":
     # Validate all generated peptides
-    stats, valid_peptides = validate_all_generated()
+    stats, validated_peptides = validate_all_generated()
     
     print(f"\n\nValidation complete!")
-    print(f"Total valid BBBP+ peptides: {len(valid_peptides)}")
+    print(f"Total valid BBBP+ peptides: {len(validated_peptides)}")

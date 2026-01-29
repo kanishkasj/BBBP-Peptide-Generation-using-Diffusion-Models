@@ -76,28 +76,14 @@ def run_full_pipeline(skip_training=False, skip_generation=False, skip_validatio
         print("\n[SKIP] Classifier training skipped (using pre-trained models)")
     
     # ========================================
-    # STEP 5: Verify Gradio App (optional)
+    # STEP 5: Train Diffusion Model
     # ========================================
-    print("\n" + "=" * 70)
-    print("PHASE 3: GRADIO UI VERIFICATION")
-    print("=" * 70)
-    
-    from gradio_app import validate_peptide_via_gradio
-    
-    test_seqs = ["YGGFL", "MEHFRW", "ACDEFGHIK"]
-    print("\nTesting Gradio interface with sample sequences:")
-    for seq in test_seqs:
-        prob, is_bbbp = validate_peptide_via_gradio(seq)
-        label = "BBBP" if is_bbbp else "Non-BBBP"
-        print(f"  {seq}: {prob:.4f} ({label})")
-
     diffusion_tracker = None
     
     if not skip_training:
         print("\n" + "=" * 70)
-        print("PHASE 4: TRAINING DIFFUSION MODEL")
+        print("PHASE 3: TRAINING DIFFUSION MODEL")
         print("=" * 70)
-        
         
         diffusion_tracker = DiffusionTrainingTracker()
         
@@ -120,14 +106,14 @@ def run_full_pipeline(skip_training=False, skip_generation=False, skip_validatio
         print("\n[SKIP] Diffusion training skipped (using pre-trained models)")
     
     # ========================================
-    # STEP 7: Generate Peptides
+    # STEP 6: Generate Peptides
     # ========================================
     generated_sequences = []  
     bbbp_scores = []          
     
     if not skip_generation:
         print("\n" + "=" * 70)
-        print("PHASE 5: PEPTIDE GENERATION")
+        print("PHASE 4: PEPTIDE GENERATION")
         print("=" * 70)
         
         from diffusion_model import load_diffusion_model
@@ -153,11 +139,11 @@ def run_full_pipeline(skip_training=False, skip_generation=False, skip_validatio
         print("\n[SKIP] Peptide generation skipped")
     
     # ========================================
-    # STEP 8: Validate Generated Peptides
+    # STEP 7: Validate Generated Peptides
     # ========================================
     if not skip_validation and not skip_generation:
         print("\n" + "=" * 70)
-        print("PHASE 6: VALIDATION")
+        print("PHASE 5: VALIDATION")
         print("=" * 70)
         
         from validation import validate_all_generated
@@ -174,10 +160,12 @@ def run_full_pipeline(skip_training=False, skip_generation=False, skip_validatio
     else:
         print("\n[SKIP] Validation skipped")
     
-
+    # ========================================
+    # STEP 8: Diffusion Model Evaluation
+    # ========================================
     if not skip_generation and generated_sequences and bbbp_scores:
         print("\n" + "=" * 70)
-        print("PHASE 7: DIFFUSION MODEL EVALUATION")
+        print("PHASE 6: DIFFUSION MODEL EVALUATION")
         print("=" * 70)
         
         from diffusion_evaluation import evaluate_diffusion_model
@@ -192,6 +180,7 @@ def run_full_pipeline(skip_training=False, skip_generation=False, skip_validatio
             threshold=BBBP_THRESHOLD,
             save_dir=eval_dir
         )
+        
         import json
         metrics_path = os.path.join(eval_dir, 'diffusion_metrics.json')
         with open(metrics_path, 'w') as f:
@@ -223,5 +212,6 @@ def run_full_pipeline(skip_training=False, skip_generation=False, skip_validatio
     print(f"    - length_distribution.png")
     print(f"    - diffusion_metrics.json")
 
+
 if __name__ == "__main__":
-    main()
+    run_full_pipeline()
