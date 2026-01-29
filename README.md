@@ -2,7 +2,7 @@
 
 A complete end-to-end system for generating Blood-Brain Barrier Permeable (BBBP) peptides using a custom discrete diffusion model.
 
-## 🎯 Overview
+## Overview
 
 This system implements:
 1. **BBBP Peptide Classifier** - BiLSTM + Attention with BioVec embeddings and iFeature descriptors
@@ -10,7 +10,7 @@ This system implements:
 3. **Gradio UI** - Interactive interface for validating peptide sequences
 4. **Validation Pipeline** - Automated validation of generated peptides
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 diffusion_bbbp/
@@ -40,7 +40,7 @@ diffusion_bbbp/
         └── validated_bbbp_peptides.csv
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Install Dependencies
 
@@ -77,7 +77,7 @@ python train.py --generate-only
 python train.py --validate-only
 ```
 
-## 🧬 Model Architecture
+## Model Architecture
 
 ### BBBP Classifier
 
@@ -111,7 +111,7 @@ Transformer Encoder (6 layers, 8 heads)
    Token Logits (20 amino acids)
 ```
 
-## 📊 Features
+## Features
 
 ### iFeature Descriptors (Classifier Only)
 - **AAC**: Amino Acid Composition (20 features)
@@ -123,35 +123,11 @@ Transformer Encoder (6 layers, 8 heads)
 
 Total: 2060 features
 
-## ⚠️ Design Constraints
 
-This implementation strictly follows these constraints:
-- ❌ NO protein language models (ESM, ProtBERT, etc.)
-- ❌ NO descriptors inside the diffusion model
-- ❌ NO diffusing BioVec embeddings
-- ✅ Treats sequences as short peptides (5-20 AA)
-- ✅ Diffusion operates on tokenized amino acids
-- ✅ iFeature used ONLY for classifier
-
-## 📈 Outputs
+## Outputs
 
 ### Generated Peptides
 - 500 unique peptides per length (5-20)
 - Total: 8000 peptides
 - CSV format with sequence, length, and BBBP probability
 
-### Validation
-- Threshold: BBBP probability ≥ 0.8
-- Validated peptides saved separately
-
-## 🎛️ Configuration
-
-Edit `config.py` to modify:
-- Training hyperparameters
-- Model architecture
-- Generation parameters
-- Validation threshold
-
-## 📝 License
-
-MIT License
