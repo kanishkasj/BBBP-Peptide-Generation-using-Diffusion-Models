@@ -46,36 +46,53 @@ def get_quota():
 # SAMPLING  (uses real model signature + 1-indexed tokens)
 # ─────────────────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def diffusion_sample(model, diffusion, length, num_samples, device, T=None):
-    T = T or diffusion.timesteps
-    B, L = num_samples, length
+def diffusion_sample(model, diffusion, length, num_samples, device):
+    """
+    Correct reverse discrete diffusion:
+      t=T → predict clean x0 → re-noise to t-1 → repeat → t=0
+    Uses the actual DiscreteDiffusion noise schedule (alpha_cumprod).
+    """
+    B = num_samples
+    T = diffusion.timesteps
 
-    # Padding mask: False for real positions, True for pad
     mask = torch.zeros(B, MAX_SEQ_LEN, dtype=torch.bool, device=device)
     mask[:, length:] = True
-
     lengths_t = torch.full((B,), length, dtype=torch.long, device=device)
-    labels_t  = torch.ones((B,),          dtype=torch.long, device=device)  # BBBP=1
+    labels_t  = torch.ones((B,),          dtype=torch.long, device=device)
 
-    # Start: random tokens in 1-indexed range [1, VOCAB_SIZE] padded to MAX_SEQ_LEN
+    # Start: fully noisy (random tokens 1-20)
     x = torch.zeros(B, MAX_SEQ_LEN, dtype=torch.long, device=device)
     x[:, :length] = torch.randint(1, VOCAB_SIZE + 1, (B, length), device=device)
 
     for t_val in range(T - 1, -1, -1):
         t_tensor = torch.full((B,), t_val, dtype=torch.long, device=device)
-        logits   = model(x, t_tensor, lengths_t, labels_t, mask)  # (B, MAX_SEQ_LEN, 20)
-        logits   = logits[:, :length, :]                           # (B, L, 20)
+
+        # 1. Predict clean tokens x0 from noisy x_t
+        logits = model(x, t_tensor, lengths_t, labels_t, mask)  # (B, MAX_SEQ_LEN, 20)
+        logits = logits[:, :length, :]                           # (B, L, 20)
+
+        # Sample predicted x0 (0-indexed)
+        x0_pred = torch.multinomial(
+            F.softmax(logits.contiguous().view(B * length, 20), dim=-1), 1
+        ).view(B, length)  # 0-indexed (0–19)
 
         if t_val == 0:
-            tokens = logits.argmax(dim=-1)                         # greedy final step
-        else:
-            tokens = torch.multinomial(
-                F.softmax(logits.contiguous().view(B * length, 20), dim=-1), 1
-            ).view(B, length)
+            # Final step: just use argmax, no re-noising
+            x[:, :length] = logits.argmax(dim=-1) + 1  # back to 1-indexed
+            break
 
-        x[:, :length] = tokens + 1   # shift 0-19 → 1-20
+        # 2. Re-noise x0_pred to level t-1 using the noise schedule
+        alpha_prev = diffusion.alpha_cumprod[t_val - 1].to(device)
+        corrupt_prob = 1.0 - alpha_prev  # probability of replacing with random token
 
-    # Decode to strings
+        keep_mask = torch.rand(B, length, device=device) >= corrupt_prob
+        random_tokens = torch.randint(0, VOCAB_SIZE, (B, length), device=device)  # 0-indexed
+
+        # Where keep_mask=True → use x0_pred, else → random token
+        x_prev = torch.where(keep_mask, x0_pred, random_tokens)
+        x[:, :length] = x_prev + 1  # shift to 1-indexed
+
+    # Decode
     seqs = []
     for b in range(B):
         seq = "".join(IDX_TO_AA.get((x[b, p] - 1).item(), "") for p in range(length))
@@ -87,13 +104,35 @@ def diffusion_sample(model, diffusion, length, num_samples, device, T=None):
 # ─────────────────────────────────────────────────────────────────────────────
 # STRUCTURAL FILTER
 # ─────────────────────────────────────────────────────────────────────────────
+MAX_SINGLE_AA_FRAC = 0.4   # no single AA can be >40% of the sequence
+MIN_UNIQUE_AA      = 4     # sequence must contain at least 4 distinct AAs
+MAX_NGRAM_FRAC     = 0.35  # no single 3-mer can appear in >35% of positions
+
 def is_valid(seq, length):
     if not isinstance(seq, str) or len(seq) != length: return False
     if any(c not in AA_TO_IDX for c in seq):           return False
+
+    # 1. Block "CK" dimers
     if seq.count("CK") > 1:                            return False
+
+    # 2. Diversity: no single AA dominates (catches NNNNN, QQQQQ, TTTTT)
+    counts = Counter(seq)
+    if counts.most_common(1)[0][1] / length > MAX_SINGLE_AA_FRAC: return False
+
+    # 3. Minimum unique AAs (catches low-complexity sequences)
+    if len(counts) < MIN_UNIQUE_AA:                    return False
+
+    # 4. Soft ngram repetition — scaled to length
+    #    Short seqs: strict (no repeated trimers)
+    #    Long seqs:  allow some repeats but cap fraction
+    trimers = [seq[i:i+3] for i in range(length - 2)]
+    tri_counts = Counter(trimers)
+    most_common_tri_frac = tri_counts.most_common(1)[0][1] / len(trimers)
     if length <= TRIMER_MAX_LEN:
-        counts = Counter(seq[i:i+3] for i in range(len(seq) - 2))
-        if any(v > 1 for v in counts.values()):        return False
+        if most_common_tri_frac > 1 / len(trimers):   return False  # strict: no repeats
+    else:
+        if most_common_tri_frac > MAX_NGRAM_FRAC:      return False  # soft cap
+
     return True
 
 # ─────────────────────────────────────────────────────────────────────────────
