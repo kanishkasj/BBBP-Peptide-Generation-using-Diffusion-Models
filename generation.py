@@ -1,253 +1,225 @@
-import os
+"""
+generation.py  —  Generate 1000 BBBP peptides (lengths 5-20)
+Uses the REAL diffusion model architecture from diffusion_model.py
+"""
+import os, pickle
+from collections import Counter
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
+import pandas as pd
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from transformers import EsmTokenizer, EsmForSequenceClassification
 
-from config import (
-    DEVICE, NUM_TOKENS, MAX_SEQ_LEN, MIN_SEQ_LEN, DIFFUSION_TIMESTEPS,
-    NUM_PEPTIDES_PER_LENGTH, GENERATED_DIR, IDX_TO_AA, AMINO_ACIDS
-)
-from utils import set_seed, detokenize_sequence
-from diffusion_model import load_diffusion_model, DiscreteDiffusion
+# ── Import real model (no re-definition needed) ──────────────────────────────
+from diffusion_model import PeptideDiffusionModel, DiscreteDiffusion, load_diffusion_model
+from classifier import load_classifier
+from ifeature_descriptors import iFeatureExtractor
+from config import DEVICE, MAX_SEQ_LEN, AA_TO_IDX, AMINO_ACIDS
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS & CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+B3PPS_PATH  = r"E:\COLLEGE\AMRITA VISHWA VIDYPEETHAM _ NEW\New folder\DD\diffusion_bbbp\outputs\b3pps\best_model5"
+OUTPUT_DIR  = r"E:\COLLEGE\AMRITA VISHWA VIDYPEETHAM _ NEW\New folder\DD\diffusion_bbbp\outputs\generated"
+PLOTS_DIR   = os.path.join(OUTPUT_DIR, "prob_plots")
 
-def generate_peptides(model, diffusion, target_length, num_samples, 
-                      bbbp_label=1, temperature=1.0, top_k=0, top_p=0.9):
-    """
-    Generate peptides of a specific length using reverse diffusion
-    
-    Args:
-        model: Trained diffusion model
-        diffusion: DiscreteDiffusion instance
-        target_length: Desired peptide length
-        num_samples: Number of peptides to generate
-        bbbp_label: BBBP label conditioning (1 for BBBP+)
-        temperature: Sampling temperature
-        top_k: Top-k sampling (0 to disable)
-        top_p: Top-p (nucleus) sampling
-        
-    Returns:
-        List of generated peptide sequences
-    """
-    model.eval()
-    device = DEVICE
-    
-    generated = []
-    batch_size = min(64, num_samples)  # Process in batches
-    
-    for batch_start in tqdm(range(0, num_samples, batch_size), desc=f"Length {target_length}"):
-        current_batch_size = min(batch_size, num_samples - batch_start)
-        
-        # Initialize with random tokens
-        tokens = torch.randint(1, 21, (current_batch_size, MAX_SEQ_LEN), device=device)
-        
-        # Set padding positions to 0
-        padding_mask = torch.zeros(current_batch_size, MAX_SEQ_LEN, dtype=torch.bool, device=device)
-        padding_mask[:, target_length:] = True
-        tokens[padding_mask] = 0
-        
-        # Conditions
-        lengths = torch.full((current_batch_size,), target_length, dtype=torch.long, device=device)
-        labels = torch.full((current_batch_size,), bbbp_label, dtype=torch.long, device=device)
-        
-        # Reverse diffusion process
-        timesteps = list(range(DIFFUSION_TIMESTEPS - 1, -1, -1))
-        
-        for t_idx, t in enumerate(timesteps):
-            t_batch = torch.full((current_batch_size,), t, dtype=torch.long, device=device)
-            
-            with torch.no_grad():
-                # Predict token logits
-                logits = model(tokens, t_batch, lengths, labels, padding_mask)
-                
-                # Apply temperature
-                logits = logits / temperature
-                
-                # Apply top-k filtering
-                if top_k > 0:
-                    top_k_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    threshold = top_k_vals[:, :, -1].unsqueeze(-1)
-                    logits[logits < threshold] = float('-inf')
-                
-                # Apply top-p (nucleus) filtering
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    
-                    # Remove tokens with cumulative probability above threshold
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[:, :, 1:] = sorted_indices_to_remove[:, :, :-1].clone()
-                    sorted_indices_to_remove[:, :, 0] = 0
-                    
-                    # Scatter back to original indexing
-                    for b in range(current_batch_size):
-                        for s in range(MAX_SEQ_LEN):
-                            remove_indices = sorted_indices[b, s][sorted_indices_to_remove[b, s]]
-                            logits[b, s, remove_indices] = float('-inf')
-                
-                # Sample from distribution, candidate denoised token sequence for this timestep.
-                probs = F.softmax(logits, dim=-1)
-                sampled = torch.multinomial(probs.view(-1, probs.size(-1)), 1)
-                sampled = sampled.view(current_batch_size, MAX_SEQ_LEN)
-                
-                # Convert from logit index (0-19) to token index (1-20)
-                new_tokens = sampled + 1
-                
-                # Determine which positions to update based on timestep
-                # More positions are "denoised" as t decreases, at the start only few will be denoised !
-                alpha_t = diffusion.alpha_cumprod[t].to(device)
-                update_prob = 1 - alpha_t
-                
-                # Create update mask
-                update_mask = torch.rand(current_batch_size, MAX_SEQ_LEN, device=device) < update_prob
-                
-                # Don't update padding positions
-                update_mask[padding_mask] = False
-                
-                # For final steps, force update all non-padding
-                if t < 10:
-                    update_mask[:, :target_length] = True
-                
-                # Update tokens
-                tokens = torch.where(update_mask, new_tokens, tokens)
-                tokens[padding_mask] = 0
-        
-        # Convert to sequences
-        for i in range(current_batch_size):
-            seq = detokenize_sequence(tokens[i])
-            if len(seq) == target_length:
-                generated.append(seq)
-    
-    return generated
+IDX_TO_AA       = {i: aa for aa, i in AA_TO_IDX.items()}
+VOCAB_SIZE      = len(AMINO_ACIDS)          # 20
+MIN_LEN, MAX_LEN = 5, 20
+TARGET_TOTAL    = 1000
+INT_THRESH      = 0.5
+B3P_THRESH      = 0.5
+CLF_LOGIC       = "or"      # "or" = either passes | "and" = both must pass
+TRIMER_MAX_LEN  = 12        # trimer filter only for seqs shorter than this
+BATCH_CLF       = 64
+MAX_ROUNDS      = 60
 
+def get_quota():
+    q = {l: 63 for l in range(MIN_LEN, 13)}
+    q.update({l: 62 for l in range(13, MAX_LEN + 1)})
+    assert sum(q.values()) == TARGET_TOTAL
+    return q
 
-def generate_all_lengths(model, diffusion, num_per_length=NUM_PEPTIDES_PER_LENGTH,
-                         min_len=MIN_SEQ_LEN, max_len=MAX_SEQ_LEN):
-    """
-    Generate peptides for all lengths from min_len to max_len
-    
-    Args:
-        model: Trained diffusion model
-        diffusion: DiscreteDiffusion instance
-        num_per_length: Number of peptides to generate per length
-        min_len: Minimum length (default 5)
-        max_len: Maximum length (default 20)
-        
-    Returns:
-        Dictionary mapping length to list of sequences
-    """
-    print("\n" + "=" * 60)
-    print("STEP 7: Generating Peptides")
-    print("=" * 60)
-    
-    set_seed()
-    os.makedirs(GENERATED_DIR, exist_ok=True)
-    
-    all_generated = {}
-    
-    for length in range(min_len, max_len + 1):
-        print(f"\nGenerating {num_per_length} peptides of length {length}...")
-        
-        # Generate more than needed to account for filtering
-        peptides = generate_peptides(
-            model, diffusion,
-            target_length=length,
-            num_samples=int(num_per_length * 1.5),  # Generate extra
-            bbbp_label=1,
-            temperature=0.8,
-            top_p=0.9
-        )
-        
-        # Remove duplicates and filter by length
-        unique_peptides = []
-        seen = set()
-        for pep in peptides:
-            if pep not in seen and len(pep) == length and is_valid_peptide(pep):
-                seen.add(pep)
-                unique_peptides.append(pep)
-        
-        # Take required number
-        final_peptides = unique_peptides[:num_per_length]
-        all_generated[length] = final_peptides
-        
-        print(f"  Generated {len(final_peptides)} unique valid peptides")
-        
-        # Save to CSV
-        df = pd.DataFrame({
-            'seq': final_peptides,
-            'len': [length] * len(final_peptides),
-            'label': [1] * len(final_peptides)  # All generated as BBBP+
-        })
-        
-        csv_path = os.path.join(GENERATED_DIR, f"len_{length}.csv")
-        df.to_csv(csv_path, index=False)
-        print(f"  Saved to {csv_path}")
-    
-    # Save combined file
-    all_peptides = []
-    for length, peptides in all_generated.items():
-        for pep in peptides:
-            all_peptides.append({'seq': pep, 'len': length, 'label': 1})
-    
-    combined_df = pd.DataFrame(all_peptides)
-    combined_path = os.path.join(GENERATED_DIR, "all_generated.csv")
-    combined_df.to_csv(combined_path, index=False)
-    print(f"\nAll peptides saved to {combined_path}")
-    print(f"Total generated: {len(all_peptides)} peptides")
-    
-    return all_generated
+# ─────────────────────────────────────────────────────────────────────────────
+# SAMPLING  (uses real model signature + 1-indexed tokens)
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def diffusion_sample(model, diffusion, length, num_samples, device, T=None):
+    T = T or diffusion.timesteps
+    B, L = num_samples, length
 
+    # Padding mask: False for real positions, True for pad
+    mask = torch.zeros(B, MAX_SEQ_LEN, dtype=torch.bool, device=device)
+    mask[:, length:] = True
 
-def is_valid_peptide(sequence):
-    """Check if sequence contains only valid amino acids"""
-    return all(aa in AMINO_ACIDS for aa in sequence.upper())
+    lengths_t = torch.full((B,), length, dtype=torch.long, device=device)
+    labels_t  = torch.ones((B,),          dtype=torch.long, device=device)  # BBBP=1
 
+    # Start: random tokens in 1-indexed range [1, VOCAB_SIZE] padded to MAX_SEQ_LEN
+    x = torch.zeros(B, MAX_SEQ_LEN, dtype=torch.long, device=device)
+    x[:, :length] = torch.randint(1, VOCAB_SIZE + 1, (B, length), device=device)
 
-def generate_single_batch(model, diffusion, length, num_samples, temperature=0.8):
-    """
-    Generate a single batch of peptides (utility function)
-    
-    Args:
-        model: Diffusion model
-        diffusion: Diffusion process
-        length: Target length
-        num_samples: Number to generate
-        temperature: Sampling temperature
-        
-    Returns:
-        List of generated sequences
-    """
-    model.eval()
-    
-    peptides = generate_peptides(
-        model, diffusion,
-        target_length=length,
-        num_samples=num_samples,
-        bbbp_label=1,
-        temperature=temperature,
-        top_p=0.9
-    )
-    
-    # Filter valid unique peptides
-    unique = list(set([p for p in peptides if len(p) == length and is_valid_peptide(p)]))
-    return unique
+    for t_val in range(T - 1, -1, -1):
+        t_tensor = torch.full((B,), t_val, dtype=torch.long, device=device)
+        logits   = model(x, t_tensor, lengths_t, labels_t, mask)  # (B, MAX_SEQ_LEN, 20)
+        logits   = logits[:, :length, :]                           # (B, L, 20)
 
+        if t_val == 0:
+            tokens = logits.argmax(dim=-1)                         # greedy final step
+        else:
+            tokens = torch.multinomial(
+                F.softmax(logits.contiguous().view(B * length, 20), dim=-1), 1
+            ).view(B, length)
+
+        x[:, :length] = tokens + 1   # shift 0-19 → 1-20
+
+    # Decode to strings
+    seqs = []
+    for b in range(B):
+        seq = "".join(IDX_TO_AA.get((x[b, p] - 1).item(), "") for p in range(length))
+        seq = "".join(c for c in seq if c in AA_TO_IDX)
+        if seq:
+            seqs.append(seq)
+    return seqs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRUCTURAL FILTER
+# ─────────────────────────────────────────────────────────────────────────────
+def is_valid(seq, length):
+    if not isinstance(seq, str) or len(seq) != length: return False
+    if any(c not in AA_TO_IDX for c in seq):           return False
+    if seq.count("CK") > 1:                            return False
+    if length <= TRIMER_MAX_LEN:
+        counts = Counter(seq[i:i+3] for i in range(len(seq) - 2))
+        if any(v > 1 for v in counts.values()):        return False
+    return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLASSIFIERS
+# ─────────────────────────────────────────────────────────────────────────────
+def load_b3pps(path, device):
+    if not os.path.exists(path):
+        print(f"[!] B3PPs not found at {path}"); return None
+    tok = EsmTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D", do_lower_case=False)
+    mdl = EsmForSequenceClassification.from_pretrained(path).to(device).eval()
+    print("[✓] B3PPs ESM classifier loaded"); return (tok, mdl)
+
+def score_batch(seqs, int_model, scaler, biovec, extractor, b3pps, device):
+    from classifier import BBBPClassifier
+    # Internal classifier
+    ngram = biovec.ngram
+    ifeats = scaler.transform(np.array([extractor.extract_all_features(s) for s in seqs]))
+    bvecs  = np.array([biovec.embed_sequence_padded(s, MAX_SEQ_LEN) for s in seqs])
+    lens   = [len(s) - ngram + 1 for s in seqs]
+    with torch.no_grad():
+        int_probs = int_model(
+            torch.tensor(bvecs,  dtype=torch.float32).to(device),
+            torch.tensor(ifeats, dtype=torch.float32).to(device),
+            torch.tensor(lens,   dtype=torch.long).to(device),
+        ).cpu().numpy()
+    int_preds = (int_probs >= INT_THRESH).astype(int)
+
+    # B3PPs classifier
+    if b3pps:
+        tok, mdl = b3pps
+        enc = tok(seqs, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        enc = {k: v.to(device) for k, v in enc.items()}
+        with torch.no_grad():
+            b3_probs = torch.sigmoid(mdl(**enc).logits)[:, 1].cpu().numpy()
+        b3_preds = (b3_probs >= B3P_THRESH).astype(int)
+    else:
+        b3_probs, b3_preds = int_probs.copy(), int_preds.copy()
+
+    results = []
+    for i, seq in enumerate(seqs):
+        ok = (int_preds[i] or b3_preds[i]) if CLF_LOGIC == "or" else (int_preds[i] and b3_preds[i])
+        results.append({"seq": seq, "internal_prob": float(int_probs[i]),
+                        "b3pps_prob": float(b3_probs[i])} if ok else None)
+    return results
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GENERATION LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_all(diff_model, diffusion, int_model, scaler, biovec, b3pps, extractor, quota, device):
+    seen, records = set(), []
+    for length in range(MIN_LEN, MAX_LEN + 1):
+        need, bucket, rounds = quota[length], [], 0
+        print(f"\n── Length {length:2d}  (need {need}) ──────────")
+        while len(bucket) < need and rounds < MAX_ROUNDS:
+            rounds += 1
+            raw  = diffusion_sample(diff_model, diffusion, length, max(256, need * 8), device)
+            cands = [s for s in raw if s not in seen and is_valid(s, length)]
+            hit = 0
+            for i in range(0, len(cands), BATCH_CLF):
+                if len(bucket) >= need: break
+                for seq, r in zip(cands[i:i+BATCH_CLF],
+                                  score_batch(cands[i:i+BATCH_CLF], int_model, scaler,
+                                              biovec, extractor, b3pps, device)):
+                    if r and len(bucket) < need:
+                        seen.add(seq); bucket.append({**r, "seq": seq, "len": length, "label": 1}); hit += 1
+            print(f"  r{rounds:02d}: raw={len(raw)} struct={len(cands)} clf={hit} total={len(bucket)}/{need}")
+        if len(bucket) < need: print(f"  ⚠ WARNING: {len(bucket)}/{need}")
+        records.extend(bucket[:need])
+    return pd.DataFrame(records).sort_values("len").reset_index(drop=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOTS
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_distributions(df, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    bins = np.linspace(0, 1, 21)
+    def side_bars(ax, a, b, bins):
+        ca, cb = "steelblue", "darkorange"
+        na, _ = np.histogram(a, bins); nb, e = np.histogram(b, bins)
+        w = (e[1]-e[0]) * 0.42; cx = (e[:-1]+e[1:])/2
+        ax.bar(cx-w/2, na, w, color=ca, alpha=0.85, label="Internal", edgecolor="white")
+        ax.bar(cx+w/2, nb, w, color=cb, alpha=0.85, label="B3PPs",    edgecolor="white")
+
+    for length in sorted(df["len"].unique()):
+        sub = df[df["len"] == length]
+        fig, ax = plt.subplots(figsize=(7, 4))
+        side_bars(ax, sub["internal_prob"], sub["b3pps_prob"], bins)
+        ax.set(title=f"Length {length} (n={len(sub)})", xlabel="Probability",
+               ylabel="Count", xlim=(0,1)); ax.legend(); ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_dir, f"len{length:02d}.png"), dpi=150); plt.close(fig)
+
+    fig, axes = plt.subplots(4, 4, figsize=(20, 16))
+    for ax, l in zip(axes.flatten(), sorted(df["len"].unique())):
+        sub = df[df["len"] == l]; side_bars(ax, sub["internal_prob"], sub["b3pps_prob"], bins)
+        ax.set_title(f"Len {l} (n={len(sub)})", fontsize=9); ax.set_xlim(0,1); ax.grid(axis="y", alpha=0.3)
+    fig.legend(handles=[plt.Rectangle((0,0),1,1,color="steelblue",alpha=0.85,label="Internal"),
+                        plt.Rectangle((0,0),1,1,color="darkorange",alpha=0.85,label="B3PPs")],
+               loc="lower right"); fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "overview.png"), dpi=150, bbox_inches="tight"); plt.close(fig)
+    print(f"[✓] Plots saved → {save_dir}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    print(f"Using device: {DEVICE}")
+    diff_model, diffusion           = load_diffusion_model()          # from diffusion_model.py
+    int_model, scaler, biovec       = load_classifier()               # from classifier.py
+    b3pps                           = load_b3pps(B3PPS_PATH, DEVICE)
+    extractor                       = iFeatureExtractor()
+    print("[✓] All models loaded")
+
+    df = generate_all(diff_model, diffusion, int_model, scaler, biovec, b3pps, extractor, get_quota(), DEVICE)
+    df = df.drop_duplicates("seq").reset_index(drop=True)
+    df = df[df.apply(lambda r: is_valid(r["seq"], int(r["len"])), axis=1)].copy()
+
+    counts = df.groupby("len").size().to_dict()
+    print("\n── Final counts ──────────────────")
+    for l in range(MIN_LEN, MAX_LEN+1): print(f"  len {l:2d}: {counts.get(l,0):3d}")
+    print(f"  TOTAL : {len(df)}")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    df.to_csv(os.path.join(OUTPUT_DIR, "bbbp_1000_dual.csv"), index=False)
+    df["seq"].to_csv(os.path.join(OUTPUT_DIR, "bbbp_1000_dual.txt"), index=False, header=False)
+    plot_distributions(df, PLOTS_DIR)
 
 if __name__ == "__main__":
-    # Load model
-    print("Loading diffusion model...")
-    model, diffusion = load_diffusion_model()
-    
-    # Generate peptides for all lengths
-    generated = generate_all_lengths(model, diffusion)
-    
-    # Print summary
-    print("\n" + "=" * 60)
-    print("GENERATION SUMMARY")
-    print("=" * 60)
-    for length in sorted(generated.keys()):
-        print(f"  Length {length:2d}: {len(generated[length]):4d} peptides")
-        if generated[length]:
-            print(f"    Examples: {generated[length][:3]}")
+    main()
